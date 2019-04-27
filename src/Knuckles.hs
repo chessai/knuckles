@@ -92,7 +92,7 @@ buildHeader targetMod = hcat
   , "import qualified Hedgehog.Range as Range\n"
   , "import Hedgehog.Classes\n"
   , "import Hedgehog.Generic\n"
-  , hcat ["import ", O.text (targetMod <> ".hs"), "\n\n"]
+  , hcat ["import ", O.text targetMod, "\n\n"]
   ]
 
 data TyLaws = TyLaws
