@@ -1,9 +1,10 @@
 {-# language GeneralizedNewtypeDeriving #-}
-{-# language OverloadedStrings #-}
 {-# language LambdaCase #-}
+{-# language OverloadedStrings #-}
 {-# language ViewPatterns #-}
+{-# language StandaloneDeriving #-}
 
-module Knuckles (generate) where
+module Knuckles where
 
 import Data.Map.Strict (Map)
 import Data.Maybe (mapMaybe)
@@ -16,6 +17,8 @@ import InstEnv
 import Module
 import Name
 import Outputable hiding ((<>),text)
+import TyCon
+import Type
 import qualified Data.Map.Strict as M
 import qualified Outputable as O
 
@@ -24,6 +27,7 @@ data Supported
   | Eq
   | Semigroup
   | Monoid
+  | Generic
   deriving (Eq,Show,Enum,Bounded)
 
 instance HasOccName Supported where
@@ -32,6 +36,7 @@ instance HasOccName Supported where
     Eq -> mkTcOcc "Eq"
     Semigroup -> mkTcOcc "Semigroup"
     Monoid -> mkTcOcc "Monoid"
+    Generic -> mkTcOcc "Generic"
 
 supportedToLaws :: Supported -> SDoc
 supportedToLaws = \case
@@ -39,6 +44,7 @@ supportedToLaws = \case
   Eq -> "eqLaws"
   Semigroup -> "semigroupLaws"
   Monoid -> "monoidLaws"
+  Generic -> "genericLaws"
 
 supportedOccNames :: [OccName]
 supportedOccNames = map occName ([minBound .. maxBound] :: [Supported])
@@ -53,20 +59,41 @@ occNameToSupported o = if isSupported o
     "Eq" -> Just Eq
     "Semigroup" -> Just Semigroup
     "Monoid" -> Just Monoid
+    "Generic" -> Just Generic
     _ -> Nothing
   else Nothing
 
-build :: String -> [HClass] -> [SDoc]
-build targetMod hs = header : punctuate "\n" (map outputTyLaws (htoTyLaws (hfromList hs)))
-  where
-    header = hcat
-      [ "module Laws where\n\n"
-      , "import Hedgehog\n"
-      , "import qualified Hedgehog.Gen as Gen\n"
-      , "import qualified Hedgehog.Range as Range\n"
-      , "import Hedgehog.Classes\n"
-      , "import " O.<> O.text (targetMod <> ".hs") O.<> "\n\n"
-      ]
+build :: ()
+  => String
+  -> [HClass]
+  -> [SDoc]
+build targetMod hs = concat
+  [ [buildHeader targetMod]
+  , [buildBody hs]
+  , ["\n"]
+  ]
+
+prebuild0 :: [HClass] -> [TyLaws]
+prebuild0 = htoTyLaws . hfromList
+
+prebuild :: [HClass] -> [Datum]
+prebuild = map genDatum . prebuild0
+
+buildBody :: [HClass] -> SDoc
+buildBody = body_ . prebuild
+
+buildHeader :: ()
+  => String -- ^ target module
+  -> SDoc
+buildHeader targetMod = hcat
+  [ "module Laws where\n\n"
+  , "import Hedgehog\n"
+  , "import qualified Hedgehog.Gen as Gen\n"
+  , "import qualified Hedgehog.Range as Range\n"
+  , "import Hedgehog.Classes\n"
+  , "import Hedgehog.Generic\n"
+  , hcat ["import ", O.text (targetMod <> ".hs"), "\n\n"]
+  ]
 
 data TyLaws = TyLaws
   { _tyLawsType :: Type
@@ -76,30 +103,76 @@ data TyLaws = TyLaws
 isValid :: TyLaws -> Bool
 isValid (TyLaws _ os) = any (== Show) os && any (== Eq) os
 
-outputTyLaws :: TyLaws -> SDoc
-outputTyLaws (TyLaws t os) = hcat
-  [ tyLaws
-  , " :: Gen "
-  , ty
-  , " -> [(String,[Laws])]\n"
-  , tyLaws
-  , " gen = [(\""
-  , ty
-  , "\", tyLaws')]\n"
-  , "  where\n"
-  , "    tyLaws' =\n"
-  , "      [ "
-  , tyLaws'
-  , "      ]\n"
+isGeneric :: TyLaws -> Bool
+isGeneric (TyLaws _ os) = any (== Generic) os
+
+body_ :: [Datum] -> SDoc
+body_ d = hcat
+  [ main_
+  , "\n"
+  , allLaws d
+  , "\n"
+  , allCode d
+  , "\n"
+  ]
+
+main_ :: SDoc
+main_ = hcat
+  [ "main :: IO ()\n"
+  , "main = lawsCheckMany allLaws\n"
+  ]
+
+allLaws :: [Datum] -> SDoc
+allLaws d = hcat
+  [ "allLaws :: [(String,[Laws])]\n"
+  , "allLaws = mconcat\n"
+  , "  [ "
+  , allLaws'
+  , "  ]\n"
   ]
   where
-    ty = ppr t
-    tyLaws = hcat ["_", ty, "Laws"]
-    tyLaws' = hcat $ fixup (map (\o -> supportedToLaws o O.<> " gen\n") os)
+    allLaws' = hcat
+      $ punctuate "  , "
+      $ map (\(Datum _ ident gen) -> hcat [ident, " ", gen, "\n"]) d
 
-fixup :: [SDoc] -> [SDoc]
-fixup [] = []
-fixup (x:xs) = punctuate "      , " (x : xs)
+allCode :: [Datum] -> SDoc
+allCode d = hcat
+  $ punctuate "\n"
+  $ map (\(Datum c _ _) -> c) d
+
+genDatum :: TyLaws -> Datum
+genDatum tyl@(TyLaws t os) =
+  let ty = ppr t
+      tyCon = ppr (tyConName (tyConAppTyCon t))
+      genTy = hcat ["gen",tyCon]
+      genV = if isGeneric tyl
+        then "hgen"
+        else hcat ["error \"", genTy, ": not implemented\""]
+      tyLaws = hcat ["_", tyCon, "Laws"]
+      tyLaws' = hcat
+        $ punctuate "      , "
+        $ map (\o -> supportedToLaws o O.<> " gen\n") os
+      codeGen = hcat
+        [ genTy, " :: Gen (", ty, ")\n"
+        , genTy, " = ", genV, "\n"
+        ]
+      codeLaw = hcat
+        [ tyLaws, " :: Gen (", ty, ") -> [(String, [Laws])]\n"
+        , tyLaws, " gen = [(\"", ty, "\", tyLaws')]\n"
+        , "  where\n"
+        , "    tyLaws' =\n"
+        , "      [ "
+        , tyLaws'
+        , "      ]\n"
+        ]
+      code = hcat [codeGen,"\n",codeLaw]
+  in Datum code tyLaws genTy
+
+data Datum = Datum
+  { _datumCode :: SDoc
+  , _datumIdentifier :: SDoc
+  , _datumGenerator :: SDoc
+  }
 
 newtype UnsafeType = UnsafeType Type
   deriving (Outputable)
@@ -145,25 +218,6 @@ data HClass = HClass
 instance Outputable HClass where
   ppr (HClass x y) = ppr (x,y)
 
-{- 
-printInterestingNames :: IO ()
-printInterestingNames = getInterestingNames >>= myPrint
-
-printClsInsts :: IO ()
-printClsInsts = getClsInsts >>= myPrint
-
-printClsInstsOccNames :: IO ()
-printClsInstsOccNames = getClsInstsOccNames >>= myPrint
-
-printClsInstsOccNamesWithTypes :: IO ()
-printClsInstsOccNamesWithTypes = getClsInstsOccNamesWithTypes >>= myPrint
-
-printFOO :: IO ()
-printFOO = do
-  hclasses <- getClsInstsOccNamesWithTypes
-  myPrint' (build hclasses) 
--}
-
 generate :: ()
   => String -- ^ module name without ".hs"
   -> FilePath -- ^ output file, without ".hs"
@@ -174,108 +228,52 @@ generate targetMod outFile = do
   writeFile (outFile <> ".hs") (mconcat p) 
 
 getHClasses :: String -> IO [HClass]
-getHClasses targetMod = defaultGhc targetMod $ do
+getHClasses targetMod = simpleLoad targetMod $ do
   t <- typecheck targetMod
   pure $ gatherHClasses t
  
-{-
-getClsInstsOccNamesWithTypes :: IO [HClass]
-getClsInstsOccNamesWithTypes = defaultGhc $ do
-  t <- typecheck targetMod
-  pure $ gatherClsInstsOccNamesWithTypes t
-
-getClsInstsOccNames :: IO [OccName]
-getClsInstsOccNames = defaultGhc $ do
-  t <- typecheck targetMod
-  pure $ gatherClsInstOccNames t
-   
-getInterestingNames :: IO [Name]
-getInterestingNames = defaultGhc $ do
-  targetModule <- mkModuleFromStr targetMod
-  names <- getNames targetMod
-  pure $ interestingNames names targetModule
-
-getClsInsts :: IO [ClsInst]
-getClsInsts = defaultGhc $ do
-  t <- typecheck targetMod
-  pure $ gatherClsInsts t
-
-safeShow :: Outputable a => a -> IO String
-safeShow res = safeShowSDoc (ppr res)
--}
-
 safeShowSDoc :: SDoc -> IO String
 safeShowSDoc doc = runGhc (Just libdir) $ do
   dflags <- getSessionDynFlags
   pure $ showSDoc dflags doc
 
 {-
--- | Given a module and a list of names, return only those names
---   which are 'interesting' (See 'interested').
-interestingNames :: ()
-  => [Name]
-  -> Module
-  -> [Name]
-interestingNames names m = filter (interested m) names
-
-interested :: Module -> Name -> Bool
-interested m = getPredicate $ foldMap Predicate
-  [ isTyConName
-  , moduleMatches m 
-  ]
-
-moduleMatches :: Module -> Name -> Bool
-moduleMatches m n = case nameModule_maybe n of
-  Nothing -> False
-  Just mName -> m == mName
-
--- | Return the 'Name' only if it is defined in that module.
---   We are 'interested' in a name if it is in that module.
-interestedName :: ()
-  => Name
-  -> Module
-  -> Maybe Name
-interestedName n m = do
-  mName <- nameModule_maybe n
-  if mName == m then pure n else Nothing
-
-mkModuleFromStr :: String -> Ghc Module
-mkModuleFromStr targetMod = do
-  modSum <- getModSummary $ mkModuleName targetMod
-  pure (ms_mod modSum)
+ghcDynamic :: ()
+  => String -- ^ module to compile
+  -> [String] -- ^ modules to load
+  -> Ghc a -- ^ ghc computation to run
+  -> IO a -- ^ final result
+ghcDynamic targetMod modules ghc = defaultGhc $ do
+  dflags <- getSessionDynFlags
+  _ <- setSessionDynFlags $ dflags
+    { hscTarget = HscInterpreted, ghcLink = LinkInMemory }
+  setTargets =<< sequence [ guessTarget (targetMod <> ".hs") Nothing ]
+  _ <- load LoadAllTargets
+  setContext
+    $ map (IIDecl . simpleImportDecl . mkModuleName)
+    $ targetMod : modules
+  ghc
 -}
 
-defaultGhc :: String -> Ghc a -> IO a
-defaultGhc targetMod ghc = defaultErrorHandler defaultFatalMessager defaultFlushOut $ do
-   runGhc (Just libdir) $ do
-     _ <- entry targetMod
-     ghc   
+defaultGhc :: Ghc a -> IO a
+defaultGhc ghc = defaultErrorHandler
+  defaultFatalMessager
+  defaultFlushOut
+  (runGhc (Just libdir) ghc)
+
+simpleLoad :: String -> Ghc a -> IO a
+simpleLoad targetMod ghc = defaultGhc $ do
+  _ <- defaultSetExtensions []
+  target <- guessTarget (targetMod <> ".hs") Nothing
+  setTargets [target]
+  _ <- load LoadAllTargets
+  ghc 
 
 defaultSetExtensions :: [Extension] -> Ghc [InstalledUnitId]
 defaultSetExtensions xs = do
   dflags <- getSessionDynFlags
   let dflags' = foldl xopt_set dflags xs
   setSessionDynFlags dflags'
-
-entry :: String -> Ghc SuccessFlag
-entry targetMod = do
-  _ <- defaultSetExtensions []
-  target <- guessTarget (targetMod <> ".hs") Nothing
-  setTargets [target]
-  load LoadAllTargets
-
-{- 
-getNames :: String -> Ghc [Name]
-getNames targetMod = do
-  t <- typecheck targetMod
-  pure $ gatherNames t
-
-gatherNames :: TypecheckedModule -> [Name]
-gatherNames t =
-  let (tcenv, _) = tm_internals_ t
-      names = concatMap (map gre_name) $ occEnvElts $ tcg_rdr_env tcenv
-  in names
--}
 
 gatherClsInsts :: TypecheckedModule -> [ClsInst]
 gatherClsInsts t =
@@ -289,31 +287,10 @@ gatherHClasses t =
       hclasses = map (\c -> HClass (clsInstOccName c) (is_tys c)) clsInsts
   in hclasses
 
-{-
-gatherClsInstsOccNamesWithTypes :: TypecheckedModule -> [HClass]
-gatherClsInstsOccNamesWithTypes t =
-  let clsInsts = gatherClsInsts t
-      clsInstsOccNamesWithTypes = map (\c -> HClass (clsInstOccName c) (is_tys c)) clsInsts
-  in clsInstsOccNamesWithTypes
-
-gatherClsInstsNames :: TypecheckedModule -> [Name]
-gatherClsInstsNames t =
-  let clsInsts = gatherClsInsts t
-      clsInstsNames = map is_cls_nm clsInsts
-  in clsInstsNames
--}
-  
+ 
 clsInstOccName :: ClsInst -> OccName
 clsInstOccName = occName . is_cls_nm
 
-{-
-gatherClsInstOccNames :: TypecheckedModule -> [OccName]
-gatherClsInstOccNames t =
-  let clsInsts = gatherClsInsts t
-      clsInstsOccNames = map clsInstOccName clsInsts
-  in clsInstsOccNames
--}
- 
 typecheck :: String -> Ghc TypecheckedModule
 typecheck targetMod = do
   modSum <- getModSummary $ mkModuleName targetMod

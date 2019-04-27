@@ -1,11 +1,11 @@
 {-# language DeriveGeneric #-}
 
-module C where
+module D where
 
 import GHC.Generics
 
-data Foo = Foo
+data Foo a = Foo
   deriving (Eq, Show, Ord)
 
-data Bar = Bar
+data Bar a = Bar
   deriving (Eq, Show, Generic)

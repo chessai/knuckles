@@ -6,4 +6,5 @@ main :: IO ()
 main = do
   generate "A" "ALaws"
   generate "B" "BLaws"
-  generate "B" "CLaws"
+  generate "C" "CLaws"
+  generate "D" "DLaws"

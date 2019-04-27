@@ -23,6 +23,9 @@ cabal.project.local
 .HTF/
 # Stack
 .stack-work/
+# Nix
+result
+result-*
 
 ### IDE/support
 # Vim
@@ -51,3 +54,4 @@ TAGS
 
 # other
 .DS_Store
+new.sh

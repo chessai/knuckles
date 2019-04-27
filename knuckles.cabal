@@ -29,7 +29,7 @@ extra-doc-files:
     README.md
   , CHANGELOG.md
 tested-with:
-  GHC == 8.2.2, GHC == 8.4.4, GHC == 8.6.3
+  GHC == 8.2.2, GHC == 8.4.4, GHC == 8.6.4
 
 library
   hs-source-dirs:
@@ -37,11 +37,12 @@ library
   exposed-modules:
     Knuckles
   build-depends:
-    , base >= 4.10.1.0 && < 4.13
+    , base >= 4.10.1 && < 4.13
     , containers >= 0.5 && < 0.7
     , ghc
     , ghc-paths
     , ghc-boot-th
+    , directory
   ghc-options:
     -Wall
     -O2
