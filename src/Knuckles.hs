@@ -6,8 +6,10 @@
 
 module Knuckles where
 
+import Data.Bifunctor
 import Data.Map.Strict (Map)
 import Data.Maybe (mapMaybe)
+import Data.Monoid
 import DynFlags
 import GHC
 import GHC.LanguageExtensions.Type
@@ -101,7 +103,10 @@ data TyLaws = TyLaws
   }
 
 isValid :: TyLaws -> Bool
-isValid (TyLaws _ os) = any (== Show) os && any (== Eq) os
+isValid (TyLaws _ os) = go . foldMap (bimap (All . (==Show)) (All . (==Eq)) . diag) $ os
+  where
+    diag x = (x,x)
+    go (All x,All y) = x && y
 
 isGeneric :: TyLaws -> Bool
 isGeneric (TyLaws _ os) = any (== Generic) os
