@@ -1,28 +1,158 @@
-{-# language GeneralizedNewtypeDeriving #-}
-{-# language LambdaCase #-}
-{-# language OverloadedStrings #-}
-{-# language ViewPatterns #-}
-{-# language StandaloneDeriving #-}
+{-# language
+        BangPatterns
+      , DeriveAnyClass
+      , DerivingStrategies
+      , FlexibleContexts
+      , GeneralizedNewtypeDeriving
+      , InstanceSigs
+      , LambdaCase
+      , NoMonomorphismRestriction
+      , OverloadedStrings
+      , RankNTypes
+      , RecordWildCards
+      , ScopedTypeVariables
+      , StandaloneDeriving
+      , TypeApplications
+      , ViewPatterns
+      , UndecidableInstances
+  #-}
 
 module Knuckles where
 
+import Data.Foldable (fold)
+import Control.Exception hiding (fromException)
+import Control.Monad.Except
+import Control.Monad.Reader
+import CoreSyn (isOrphan)
 import Data.Bifunctor
 import Data.Map.Strict (Map)
 import Data.Maybe (mapMaybe)
 import Data.Monoid
+import Digraph
 import DynFlags
+import Exception (ExceptionMonad(..))
 import GHC
 import GHC.LanguageExtensions.Type
 import GHC.Paths (libdir)
+import GHC.SourceGen
+import GhcMake
+import GhcMonad
+import HscMain (batchMsg)
 import HscTypes
 import InstEnv
+import Knuckles.Monad
 import Module
 import Name
+import Options.Applicative
+import DriverPhases (isHaskellishTarget)
 import Outputable hiding ((<>),text)
+import System.Environment (getArgs)
+import System.FilePath
 import TyCon
 import Type
 import qualified Data.Map.Strict as M
+import qualified Distribution.Compat.Exception as Cabal
+import qualified Distribution.ModuleName as Cabal
+import qualified Distribution.PackageDescription.Parsec as Cabal
+import qualified Distribution.Types.BuildInfo as Cabal
+import qualified Distribution.Types.CondTree as Cabal
+import qualified Distribution.Types.GenericPackageDescription as Cabal
+import qualified Distribution.Types.Library as Cabal
+import qualified Distribution.Verbosity as Cabal
 import qualified Outputable as O
+import qualified System.Directory as Dir
+
+constModule :: HsModule'
+constModule = module'
+  (Just "Const")
+  (Just [var "const", var "id"])
+  [
+  ]
+  [ typeSig "const" $ a --> b --> a
+  , funBind "const" $ matchRhs [wildP, x] x
+
+  , typeSig "id" $ a --> a
+  , funBind "id" $ matchRhs [x] x
+  ]
+  where
+    a = var "a"
+    b = var "b"
+    x = var "x"
+
+envInfo :: ParserInfo Env
+envInfo = info ((Env
+  <$> ( pure Cabal.normal
+      )
+  <*> ( strOption $ fold [ long "cabal", help "cabal file" ]
+      )
+  <*> ( strOption $ fold [ long "tld", help "top level directory of cabal project" ]
+      )
+  <*> ( strOption $ fold [ long "env", help "ghc environment file" ]
+      )) <**> helper) mempty
+
+main :: IO ()
+main = do
+  env <- execParser envInfo
+  (putStrLn . showSDocUnsafe . ppr) =<< runKnuckles'
+    env
+    (withEnv $ \(Env _ proj tld genv) -> do {
+        dflags <- getSessionDynFlags
+      ; void $ setSessionDynFlags $ dflags { packageEnv = Just genv }
+      ; liftIO $ Dir.setCurrentDirectory tld
+      ; (hsSrcDir, module_names) <- getModules proj
+      ; liftIO $ Dir.setCurrentDirectory hsSrcDir
+      ; loadProj module_names
+      ; module_graph <- getModuleGraph
+      ; tcs <- mapM typecheck (mgModSummaries module_graph)
+      ; let cls_insts = concatMap gatherClsInsts tcs
+      -- ; pure $ map clsInstOccName cls_insts
+      ; let inst_heads = map instanceHead cls_insts
+      ; let inst_sigs = map instanceSig cls_insts
+      ; pure $ fst $ (inst_heads, inst_sigs)
+      -- ; pure $ (map ClsInstPpr cls_insts, map instanceHead cls_insts)
+    })
+
+isCabal :: MonadError KnucklesError m
+  => FilePath -> m ()
+isCabal fp = unless (isExtensionOf ".cabal" fp)
+  $ throwError NotPassedACabalFile
+
+doesCabalExist :: (MonadIO m, MonadError KnucklesError m)
+  => FilePath -> m ()
+doesCabalExist fp = do
+  h <- liftIO $ Dir.doesFileExist fp
+  unless h $ throwError FilePassedDoesNotExist
+
+type HsSrcDir = FilePath
+
+getModules :: (MonadIO m, MonadError KnucklesError m, MonadReader Env m)
+  => FilePath -> m (HsSrcDir, [ModuleName])
+getModules fp = withEnv $ \(Env v _ _ _) -> do
+  pkgDescr <- liftIO $ Cabal.catchIO
+    (Right <$> Cabal.readGenericPackageDescription v fp)
+    (pure . Left)
+  case pkgDescr of
+    Left e -> throwError (CabalThrewAnError e)
+    Right g -> maybeToError (Cabal.condLibrary g) NoLibraryComponent
+      $ \condTreeLib -> do
+          let hsSrcDirs = id
+                . Cabal.hsSourceDirs
+                . Cabal.libBuildInfo
+                . Cabal.condTreeData
+                $ condTreeLib
+          when (length hsSrcDirs /= 1)
+            $ throwError MoreThanOneHsSourceDir
+          let modules = id
+                . fmap mkModuleName
+                . fmap Cabal.toFilePath
+                . Cabal.explicitLibModules
+                . Cabal.condTreeData
+                $ condTreeLib
+          pure (head hsSrcDirs, modules)
+
+maybeToError :: MonadError e m => Maybe a -> e -> (a -> m b) -> m b
+maybeToError Nothing e _ = throwError e
+maybeToError (Just a) _ f = f a
 
 data Supported
   = Show
@@ -33,13 +163,14 @@ data Supported
   deriving (Eq,Show,Enum,Bounded)
 
 instance HasOccName Supported where
-  occName = \case
-    Show -> mkTcOcc "Show"
-    Eq -> mkTcOcc "Eq"
-    Semigroup -> mkTcOcc "Semigroup"
-    Monoid -> mkTcOcc "Monoid"
-    Generic -> mkTcOcc "Generic"
+  occName x = mkTcOcc $ case x of
+    Show -> "Show"
+    Eq -> "Eq"
+    Semigroup -> "Semigroup"
+    Monoid -> "Monoid"
+    Generic -> "Generic"
 
+{-
 supportedToLaws :: Supported -> SDoc
 supportedToLaws = \case
   Show -> "showLaws"
@@ -230,13 +361,13 @@ generate :: ()
 generate targetMod outFile = do
   hclasses <- getHClasses targetMod
   p <- mapM safeShowSDoc (build targetMod hclasses)
-  writeFile (outFile <> ".hs") (mconcat p) 
+  writeFile (outFile <> ".hs") (mconcat p)
 
 getHClasses :: String -> IO [HClass]
 getHClasses targetMod = simpleLoad targetMod $ do
   t <- typecheck targetMod
   pure $ gatherHClasses t
- 
+
 safeShowSDoc :: SDoc -> IO String
 safeShowSDoc doc = runGhc (Just libdir) $ do
   dflags <- getSessionDynFlags
@@ -272,7 +403,7 @@ simpleLoad targetMod ghc = defaultGhc $ do
   target <- guessTarget (targetMod <> ".hs") Nothing
   setTargets [target]
   _ <- load LoadAllTargets
-  ghc 
+  ghc
 
 defaultSetExtensions :: [Extension] -> Ghc [InstalledUnitId]
 defaultSetExtensions xs = do
@@ -292,7 +423,6 @@ gatherHClasses t =
       hclasses = map (\c -> HClass (clsInstOccName c) (is_tys c)) clsInsts
   in hclasses
 
- 
 clsInstOccName :: ClsInst -> OccName
 clsInstOccName = occName . is_cls_nm
 
@@ -301,3 +431,72 @@ typecheck targetMod = do
   modSum <- getModSummary $ mkModuleName targetMod
   p <- parseModule modSum
   typecheckModule p
+-}
+
+typecheck :: GhcMonad m => ModSummary -> m TypecheckedModule
+typecheck (ms_mod_name -> mod_name) = do
+  p <- parseModule =<< getModSummary mod_name
+  typecheckModule p
+
+typecheckProj :: GhcMonad m => m [TypecheckedModule]
+typecheckProj = do {
+    module_graph <- getModuleGraph
+  ; mapM typecheck (mgModSummaries module_graph)
+  }
+
+getProjClsInsts :: GhcMonad m => m [ClsInst]
+getProjClsInsts = do {
+    tcs <- typecheckProj
+  ; pure $ concatMap gatherClsInsts tcs
+  }
+
+gatherClsInsts :: TypecheckedModule -> [ClsInst]
+gatherClsInsts (tm_internals_ -> (_, moddets)) = md_insts moddets
+
+clsInstOccName :: ClsInst -> OccName
+clsInstOccName = occName . is_cls_nm
+
+clsInstHead :: ClsInst -> InstanceHead
+clsInstHead (instanceHead -> (tyvars, cls, types))
+  = InstanceHead tyvars cls types
+
+data InstanceHead = InstanceHead
+  { inst_h_tyvars :: [TyVar] -- unbounded, sorted
+  , inst_h_cls :: Class -- single class
+  , inst_h_sat :: [Type]
+  }
+
+newtype ClsInstPpr = ClsInstPpr ClsInst
+instance Outputable ClsInstPpr where
+  ppr (ClsInstPpr c) = pprInst c
+
+pprInst :: ClsInst -> SDoc
+pprInst ClsInst{..} = O.hcat
+  [ O.text "Class name: ", ppr is_cls_nm, O.text "\n"
+  , O.text "Top of type args: ", ppr is_tcs, O.text "\n"
+  , O.text "DFunName: ", ppr is_dfun_name, O.text "\n"
+  , O.text "TyVars: ", ppr is_tvs, O.text "\n"
+  , O.text "Class: ", ppr is_cls, O.text "\n"
+  , O.text "Tys: ", ppr is_tys, O.text "\n"
+  , O.text "DFunId: ", ppr is_dfun, O.text "\n"
+  , O.text "Flag: ", ppr is_flag, O.text "\n"
+  , O.text "IsOrphan: ", ppr (isOrphan is_orphan), O.text "\n"
+  ]
+
+-- TODO: stop ignoring default extensions
+-- TODO: get fully qualified Class name, to ensure actual equality
+
+-- now you can `getModuleGraph` appropriately
+loadProj :: GhcMonad m => [ModuleName] -> m SuccessFlag
+loadProj ms = do
+  let targetIds = map TargetModule ms
+  let targets = map (\tId -> Target tId False Nothing) targetIds
+  setTargets targets
+  mod_graph <- depanal [] False
+  --liftIO $ print mod_graph
+  success <- load' LoadAllTargets (Just batchMsg) mod_graph
+--  warnUnusedPackages -- not exported
+  pure success
+
+-- Goals
+--

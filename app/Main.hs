@@ -1,10 +1,11 @@
 module Main (main) where
 
-import Knuckles (generate)
+import qualified Knuckles as K
 
 main :: IO ()
-main = do
-  generate "A" "ALaws"
-  generate "B" "BLaws"
-  generate "C" "CLaws"
-  generate "D" "DLaws"
+main = K.main
+
+--  generate "A" "ALaws"
+--  generate "B" "BLaws"
+--  generate "C" "CLaws"
+--  generate "D" "DLaws"
