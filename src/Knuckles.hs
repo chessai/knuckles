@@ -17,16 +17,22 @@
       , UndecidableInstances
   #-}
 
+{-# options_ghc -fno-warn-unused-imports #-}
+
 module Knuckles where
 
+import Data.Char (isSpace)
+import Data.String (fromString)
 import Data.Foldable (fold)
-import Control.Exception hiding (fromException)
 import Control.Monad.Except
 import Control.Monad.Reader
+import Class
 import CoreSyn (isOrphan)
-import Data.Bifunctor
+import Data.Bimap (Bimap)
+import qualified Data.Bimap as B
+import qualified Control.Applicative as A
+import Data.List (intercalate)
 import Data.Map.Strict (Map)
-import Data.Maybe (mapMaybe)
 import Data.Monoid
 import Digraph
 import DynFlags
@@ -62,23 +68,6 @@ import qualified Distribution.Verbosity as Cabal
 import qualified Outputable as O
 import qualified System.Directory as Dir
 
-constModule :: HsModule'
-constModule = module'
-  (Just "Const")
-  (Just [var "const", var "id"])
-  [
-  ]
-  [ typeSig "const" $ a --> b --> a
-  , funBind "const" $ matchRhs [wildP, x] x
-
-  , typeSig "id" $ a --> a
-  , funBind "id" $ matchRhs [x] x
-  ]
-  where
-    a = var "a"
-    b = var "b"
-    x = var "x"
-
 envInfo :: ParserInfo Env
 envInfo = info ((Env
   <$> ( pure Cabal.normal
@@ -101,14 +90,18 @@ main = do
       ; liftIO $ Dir.setCurrentDirectory tld
       ; (hsSrcDir, module_names) <- getModules proj
       ; liftIO $ Dir.setCurrentDirectory hsSrcDir
-      ; loadProj module_names
+      ; _ <- loadProj module_names
       ; module_graph <- getModuleGraph
       ; tcs <- mapM typecheck (mgModSummaries module_graph)
       ; let cls_insts = concatMap gatherClsInsts tcs
       -- ; pure $ map clsInstOccName cls_insts
-      ; let inst_heads = map instanceHead cls_insts
-      ; let inst_sigs = map instanceSig cls_insts
-      ; pure $ fst $ (inst_heads, inst_sigs)
+      ; let inst_heads = map clsInstHead cls_insts
+      ; let gen_map = mksGenMap inst_heads
+      ; let gen_module = genModule gen_map
+      ; dflags' <- getSessionDynFlags
+      ; let module_text = showPpr dflags' gen_module
+      ; liftIO $ writeFile "test.hs" module_text
+      ; pure $ gen_map --inst_heads
       -- ; pure $ (map ClsInstPpr cls_insts, map instanceHead cls_insts)
     })
 
@@ -154,285 +147,6 @@ maybeToError :: MonadError e m => Maybe a -> e -> (a -> m b) -> m b
 maybeToError Nothing e _ = throwError e
 maybeToError (Just a) _ f = f a
 
-data Supported
-  = Show
-  | Eq
-  | Semigroup
-  | Monoid
-  | Generic
-  deriving (Eq,Show,Enum,Bounded)
-
-instance HasOccName Supported where
-  occName x = mkTcOcc $ case x of
-    Show -> "Show"
-    Eq -> "Eq"
-    Semigroup -> "Semigroup"
-    Monoid -> "Monoid"
-    Generic -> "Generic"
-
-{-
-supportedToLaws :: Supported -> SDoc
-supportedToLaws = \case
-  Show -> "showLaws"
-  Eq -> "eqLaws"
-  Semigroup -> "semigroupLaws"
-  Monoid -> "monoidLaws"
-  Generic -> "genericLaws"
-
-supportedOccNames :: [OccName]
-supportedOccNames = map occName ([minBound .. maxBound] :: [Supported])
-
-isSupported :: OccName -> Bool
-isSupported o = any (== o) supportedOccNames
-
-occNameToSupported :: OccName -> Maybe Supported
-occNameToSupported o = if isSupported o
-  then case occNameString o of
-    "Show" -> Just Show
-    "Eq" -> Just Eq
-    "Semigroup" -> Just Semigroup
-    "Monoid" -> Just Monoid
-    "Generic" -> Just Generic
-    _ -> Nothing
-  else Nothing
-
-build :: ()
-  => String
-  -> [HClass]
-  -> [SDoc]
-build targetMod hs = concat
-  [ [buildHeader targetMod]
-  , [buildBody hs]
-  , ["\n"]
-  ]
-
-prebuild0 :: [HClass] -> [TyLaws]
-prebuild0 = htoTyLaws . hfromList
-
-prebuild :: [HClass] -> [Datum]
-prebuild = map genDatum . prebuild0
-
-buildBody :: [HClass] -> SDoc
-buildBody = body_ . prebuild
-
-buildHeader :: ()
-  => String -- ^ target module
-  -> SDoc
-buildHeader targetMod = hcat
-  [ "module Laws where\n\n"
-  , "import Hedgehog\n"
-  , "import qualified Hedgehog.Gen as Gen\n"
-  , "import qualified Hedgehog.Range as Range\n"
-  , "import Hedgehog.Classes\n"
-  , "import Hedgehog.Generic\n"
-  , hcat ["import ", O.text targetMod, "\n\n"]
-  ]
-
-data TyLaws = TyLaws
-  { _tyLawsType :: Type
-  , _tyLawsClsInsts :: [Supported]
-  }
-
-isValid :: TyLaws -> Bool
-isValid (TyLaws _ os) = go . foldMap (bimap (All . (==Show)) (All . (==Eq)) . diag) $ os
-  where
-    diag x = (x,x)
-    go (All x,All y) = x && y
-
-isGeneric :: TyLaws -> Bool
-isGeneric (TyLaws _ os) = any (== Generic) os
-
-body_ :: [Datum] -> SDoc
-body_ d = hcat
-  [ main_
-  , "\n"
-  , allLaws d
-  , "\n"
-  , allCode d
-  , "\n"
-  ]
-
-main_ :: SDoc
-main_ = hcat
-  [ "main :: IO ()\n"
-  , "main = lawsCheckMany allLaws\n"
-  ]
-
-allLaws :: [Datum] -> SDoc
-allLaws d = hcat
-  [ "allLaws :: [(String,[Laws])]\n"
-  , "allLaws = mconcat\n"
-  , "  [ "
-  , allLaws'
-  , "  ]\n"
-  ]
-  where
-    allLaws' = hcat
-      $ punctuate "  , "
-      $ map (\(Datum _ ident gen) -> hcat [ident, " ", gen, "\n"]) d
-
-allCode :: [Datum] -> SDoc
-allCode d = hcat
-  $ punctuate "\n"
-  $ map (\(Datum c _ _) -> c) d
-
-genDatum :: TyLaws -> Datum
-genDatum tyl@(TyLaws t os) =
-  let ty = ppr t
-      tyCon = ppr (tyConName (tyConAppTyCon t))
-      genTy = hcat ["gen",tyCon]
-      genV = if isGeneric tyl
-        then "hgen"
-        else hcat ["error \"", genTy, ": not implemented\""]
-      tyLaws = hcat ["_", tyCon, "Laws"]
-      tyLaws' = hcat
-        $ punctuate "      , "
-        $ map (\o -> supportedToLaws o O.<> " gen\n") os
-      codeGen = hcat
-        [ genTy, " :: Gen (", ty, ")\n"
-        , genTy, " = ", genV, "\n"
-        ]
-      codeLaw = hcat
-        [ tyLaws, " :: Gen (", ty, ") -> [(String, [Laws])]\n"
-        , tyLaws, " gen = [(\"", ty, "\", tyLaws')]\n"
-        , "  where\n"
-        , "    tyLaws' =\n"
-        , "      [ "
-        , tyLaws'
-        , "      ]\n"
-        ]
-      code = hcat [codeGen,"\n",codeLaw]
-  in Datum code tyLaws genTy
-
-data Datum = Datum
-  { _datumCode :: SDoc
-  , _datumIdentifier :: SDoc
-  , _datumGenerator :: SDoc
-  }
-
-newtype UnsafeType = UnsafeType Type
-  deriving (Outputable)
-
-instance Eq UnsafeType where
-  x == y = showSDocUnsafe (ppr x) == showSDocUnsafe (ppr y)
-
-instance Ord UnsafeType where
-  compare x y = compare (showSDocUnsafe (ppr x)) (showSDocUnsafe (ppr y))
-
-newtype HMap = HMap { _getHMap :: Map UnsafeType [OccName] }
-
-instance Semigroup HMap where
-  HMap x <> HMap y = HMap (M.unionWith (<>) x y)
-
-instance Monoid HMap where
-  mempty = HMap mempty
-
-singleton :: UnsafeType -> [OccName] -> HMap
-singleton ty os = HMap (M.singleton ty os)
-
-hsingleton :: HClass -> HMap
-hsingleton (HClass o tys) = foldMap (\ty -> singleton (UnsafeType ty) [o]) tys
-
-hfromList :: [HClass] -> HMap
-hfromList = foldMap hsingleton
-
-htoTyLaws :: HMap -> [TyLaws]
-htoTyLaws (HMap m) = M.foldMapWithKey toTyLaws m
-
-toTyLaws :: UnsafeType -> [OccName] -> [TyLaws]
-toTyLaws (UnsafeType ty) os =
-  let t = TyLaws ty (mapMaybe occNameToSupported os)
-  in if isValid t
-    then [t]
-    else []
-
-data HClass = HClass
-  { _hclassOccName :: OccName
-  , _hclassTypes :: [Type]
-  }
-
-instance Outputable HClass where
-  ppr (HClass x y) = ppr (x,y)
-
-generate :: ()
-  => String -- ^ module name without ".hs"
-  -> FilePath -- ^ output file, without ".hs"
-  -> IO ()
-generate targetMod outFile = do
-  hclasses <- getHClasses targetMod
-  p <- mapM safeShowSDoc (build targetMod hclasses)
-  writeFile (outFile <> ".hs") (mconcat p)
-
-getHClasses :: String -> IO [HClass]
-getHClasses targetMod = simpleLoad targetMod $ do
-  t <- typecheck targetMod
-  pure $ gatherHClasses t
-
-safeShowSDoc :: SDoc -> IO String
-safeShowSDoc doc = runGhc (Just libdir) $ do
-  dflags <- getSessionDynFlags
-  pure $ showSDoc dflags doc
-
-{-
-ghcDynamic :: ()
-  => String -- ^ module to compile
-  -> [String] -- ^ modules to load
-  -> Ghc a -- ^ ghc computation to run
-  -> IO a -- ^ final result
-ghcDynamic targetMod modules ghc = defaultGhc $ do
-  dflags <- getSessionDynFlags
-  _ <- setSessionDynFlags $ dflags
-    { hscTarget = HscInterpreted, ghcLink = LinkInMemory }
-  setTargets =<< sequence [ guessTarget (targetMod <> ".hs") Nothing ]
-  _ <- load LoadAllTargets
-  setContext
-    $ map (IIDecl . simpleImportDecl . mkModuleName)
-    $ targetMod : modules
-  ghc
--}
-
-defaultGhc :: Ghc a -> IO a
-defaultGhc ghc = defaultErrorHandler
-  defaultFatalMessager
-  defaultFlushOut
-  (runGhc (Just libdir) ghc)
-
-simpleLoad :: String -> Ghc a -> IO a
-simpleLoad targetMod ghc = defaultGhc $ do
-  _ <- defaultSetExtensions []
-  target <- guessTarget (targetMod <> ".hs") Nothing
-  setTargets [target]
-  _ <- load LoadAllTargets
-  ghc
-
-defaultSetExtensions :: [Extension] -> Ghc [InstalledUnitId]
-defaultSetExtensions xs = do
-  dflags <- getSessionDynFlags
-  let dflags' = foldl xopt_set dflags xs
-  setSessionDynFlags dflags'
-
-gatherClsInsts :: TypecheckedModule -> [ClsInst]
-gatherClsInsts t =
-  let (_,moddets) = tm_internals_ t
-      clsInsts = md_insts moddets
-  in clsInsts
-
-gatherHClasses :: TypecheckedModule -> [HClass]
-gatherHClasses t =
-  let clsInsts = gatherClsInsts t
-      hclasses = map (\c -> HClass (clsInstOccName c) (is_tys c)) clsInsts
-  in hclasses
-
-clsInstOccName :: ClsInst -> OccName
-clsInstOccName = occName . is_cls_nm
-
-typecheck :: String -> Ghc TypecheckedModule
-typecheck targetMod = do
-  modSum <- getModSummary $ mkModuleName targetMod
-  p <- parseModule modSum
-  typecheckModule p
--}
-
 typecheck :: GhcMonad m => ModSummary -> m TypecheckedModule
 typecheck (ms_mod_name -> mod_name) = do
   p <- parseModule =<< getModSummary mod_name
@@ -466,6 +180,15 @@ data InstanceHead = InstanceHead
   , inst_h_sat :: [Type]
   }
 
+instance Outputable InstanceHead where
+  ppr InstanceHead{..} = O.hcat
+    [ O.text "InstanceHead {\n"
+    , O.text "  , inst_h_tyvars = ", ppr inst_h_tyvars, O.text "\n"
+    , O.text "  , inst_h_cls = ", ppr inst_h_cls, O.text "\n"
+    , O.text "  , inst_h_sat = ", ppr inst_h_sat, O.text "\n"
+    , O.text "}\n"
+    ]
+
 newtype ClsInstPpr = ClsInstPpr ClsInst
 instance Outputable ClsInstPpr where
   ppr (ClsInstPpr c) = pprInst c
@@ -485,6 +208,7 @@ pprInst ClsInst{..} = O.hcat
 
 -- TODO: stop ignoring default extensions
 -- TODO: get fully qualified Class name, to ensure actual equality
+-- TODO: must be a vanilla algtycon
 
 -- now you can `getModuleGraph` appropriately
 loadProj :: GhcMonad m => [ModuleName] -> m SuccessFlag
@@ -498,5 +222,404 @@ loadProj ms = do
 --  warnUnusedPackages -- not exported
   pure success
 
--- Goals
 --
+-- Plan for Haskell98 instances
+--
+-- 1) Take haskell project as input
+-- 2) Typecheck the modules of that project
+-- 3) For each 'ClsInst', get the 'InstanceHead'
+-- 4) In the 'InstanceHead', we require that the list of 'Type'
+--    is a singleton. If it is not, discard the current 'InstanceHead'.
+-- 5) Is the 'Class' supported? If not, discard the current
+--    'InstanceHead'.
+-- 6) Code generation (based on hedgehog-classes typeclass arity)
+--
+-- Consider the following module
+--   (assume a valid TypeEnv/single-module project):
+--
+-- ```
+-- -- FooMod.hs
+--
+-- data Foo x y = Foo
+--
+-- instance Eq (Foo x y) where
+--   _ == _ = True
+--
+-- instance Functor (Foo x) where
+--   fmap _ Foo = Foo
+--
+-- instance Bifunctor Foo where
+--   bimap _ _ _ = Foo
+-- ```
+--
+-- Note that x and y are phantom (Don't worry about representation
+-- right now).
+--
+-- The following 'InstanceHead's are generated:
+--
+-- ```
+-- InstanceHead {
+--   , inst_h_tyvars = [x,y]
+--   , inst_h_cls = Eq
+--   , inst_h_sat = [Foo x y]
+-- }
+--
+-- InstanceHead {
+--   , inst_h_tyvars = [x]
+--   , inst_h_cls = Functor
+--   , inst_h_sat = [Foo x]
+-- }
+
+-- InstanceHead {
+--   , inst_h_tyvars = []
+--   , inst_h_cls = Bifunctor
+--   , inst_h_sat = [Foo]
+-- }
+-- ```
+--
+-- For each (instance,type) pair in some type isomorphic to
+-- `(Type,[Instance])`, we want to generate code based on Class kind.
+--
+-- We will label class kinds like so:
+--
+-- T1 = Type -> Constraint
+-- T2 = (Type -> Type) -> Constraint
+-- T3 = (Type -> Type -> Type) -> Constraint
+--
+-- For our example we have one of each (T1 = Eq, T2 = Functor, T3 = Bifunctor).
+--
+-- For T_N, we need (length inst_h_tyvars - N + 1) tyvars in the
+-- generated code.
+--
+-- Our generated code for our `Foo` example (note the boilerplate
+-- at the beginning):
+--
+-- ```
+-- {-# language PackageImports #-}
+--
+-- import Hedgehog
+-- import Hedgehog.Classes
+-- import Hedgehog.Generic
+-- import qualified Hedgehog.Gen as Gen
+-- import qualified Hedgehog.Range as Range
+--
+-- import "pkgName" qualified FooMod
+--
+-- main :: IO ()
+-- main = lawsCheckMany allLaws
+--
+-- type Laws' = [(String, [Laws])]
+--
+-- allLaws :: Laws'
+-- allLaws = mconcat
+--   [ _FooLaws
+--   ]
+--
+-- -- T1 gen for `Foo x y`
+-- _FooGen1 :: Gen (Foo x y)
+-- _FooGen1 = pure Foo
+--
+-- -- T2 gen for `Foo x y`
+-- _FooGen2 :: forall y. Gen y -> Gen (Foo x y)
+-- _FooGen2 _ = pure Foo
+--
+-- -- T3 gen for `Foo x y`
+-- _FooGen3 :: forall x y. Gen x -> Gen y -> Gen (Foo x y)
+-- _FooGen3 _ pure Foo
+--
+-- _FooLaws :: Laws'
+-- _FooLaws = [("Foo", tyLaws)]
+--   where
+--     tyLaws =
+--       [ eqLaws _FooGen1
+--       , functorLaws _FooGen2
+--       , bifunctorLaws _FooGen3
+--       ]
+-- ```
+--
+-- This becomes more complicated when the representation of the tyvars
+-- becomes anything but phantom.
+-- I think the best we can do is use hedgehog-generic, that is,
+-- if the representation type has a Generic instance.
+-- If it doesn't, then we might have `_TyconGenN = error "msg"`.
+--
+-- All tyvars must be kinded (TYPE 'LiftedRep).
+--
+
+supportedLaws :: Supported -> String
+supportedLaws = \case
+  Show -> "showLaws"
+  Eq -> "eqLaws"
+  Semigroup -> "monoidLaws"
+  Monoid -> "monoidLaws"
+  Generic -> "genericLaws"
+
+  Functor -> "functorLaws"
+
+  Bifunctor -> "bifunctorLaws"
+
+data Supported
+  = Show
+  | Eq
+  | Semigroup
+  | Monoid
+  | Generic
+
+  | Functor
+
+  | Bifunctor
+  deriving (Eq,Ord,Show,Enum,Bounded)
+
+instance Outputable Supported where
+  ppr = O.text . show
+
+instance HasOccName Supported where
+  occName x = mkTcOcc $ case x of
+    Show -> "Show"
+    Eq -> "Eq"
+    Semigroup -> "Semigroup"
+    Monoid -> "Monoid"
+    Generic -> "Generic"
+    Functor -> "Functor"
+    Bifunctor -> "Bifunctor"
+
+data T = T1 | T2 | T3
+  deriving (Show)
+
+instance Outputable T where
+  ppr = O.text . show
+
+data Gen = Gen
+  { gen_t :: T
+  , gen_tycon :: TyCon
+  , gen_tyvars :: [TyVar]
+  }
+
+data Instance = Instance
+  { inst_t :: T
+  , inst_supported :: Supported
+  , inst_tyvars :: [TyVar]
+  }
+
+instance Outputable Instance where
+  ppr (Instance t s ty) = ppr (t,s,ty)
+
+type GenMap = Map UnsafeType [Instance]
+
+newtype UnsafeType = UnsafeType { getUnsafeType :: Type }
+  deriving newtype (Outputable)
+
+instance Eq UnsafeType where
+  (UnsafeType x) == (UnsafeType y) = eqType x y
+
+instance Ord UnsafeType where
+  compare (UnsafeType x) (UnsafeType y)
+    = nonDetCmpType x y
+
+instances_ts :: [Instance] -> [T]
+instances_ts = map inst_t
+
+t_rdr :: T -> String
+t_rdr = \case { T1 -> "1"; T2 -> "2"; T3 -> "3" }
+
+-- number of tyvars for us to fill in
+foralldTyVars :: Instance -> Int
+foralldTyVars Instance{..} = max 0
+  (length inst_tyvars + 1 - (case inst_t of {
+    T1 -> 1; T2 -> 2; T3 -> 3
+  }))
+
+trim :: String -> String
+trim = f . f
+  where
+    f = reverse . dropWhile isSpace
+
+fresh :: [a] -> String
+fresh = intercalate " " . reverse . snd . foldl
+  (\(accNum::Int, accList) _
+     -> (accNum + 1, "x" <> show accNum : accList)
+  ) (0, [])
+
+genModule :: GenMap -> HsModule'
+genModule gen_map = module'
+  (Just "Test")
+  (Just [var "main"])
+  [ import' "Hedgehog"
+  , import' "Hedgehog.Classes"
+  , import' "Hedgehog.Generic"
+  , as' (import' "Hedgehog.Gen") "Gen"
+  ]
+  ( [type' "Laws" [] (var "[(String, [Laws])]")]
+  ++ [ typeSig "allLaws" $ var "Laws'"
+     , funBind "allLaws" $ matchRhs [] $ var $
+         fromString $ "mconcat $\n  [\n  ]"
+     ]
+  ++ genAll gen_map
+  )
+
+
+-- _FooLaws :: Laws'
+-- _FooLaws = [("Foo", tyLaws)]
+--   where
+--     tyLaws =
+--       [ eqLaws _FooGen1
+--       , functorLaws _FooGen2
+--       , bifunctorLaws _FooGen3
+--       ]
+-- ```
+
+-- type Laws' = [(String, [Laws])]
+--
+-- allLaws :: Laws'
+-- allLaws = mconcat
+--   [ _FooLaws
+--   ]
+-- import Hedgehog
+-- import Hedgehog.Classes
+-- import Hedgehog.Generic
+-- import qualified Hedgehog.Gen as Gen
+-- import qualified Hedgehog.Range as Range
+
+-- _FooLaws :: Laws'
+-- _FooLaws = [("Foo", tyLaws)]
+--   where
+--     tyLaws =
+--       [ eqLaws _FooGen1
+--       , functorLaws _FooGen2
+--       , bifunctorLaws _FooGen3
+--       ]
+-- ```
+
+tyConRdr :: Type -> String
+tyConRdr = occNameString . occName . tyConName . tyConAppTyCon
+
+{-
+data Instance = Instance
+  { inst_t :: T
+  , inst_supported :: Supported
+  , inst_tyvars :: [TyVar]
+  }
+
+-}
+
+-- TODO: a lot of the generator code is not idiomatic
+
+--genAllLaws :: GenMap -> HsExpr'
+--genAllLaws = list . M.foldMapWithKey genAllLaws'
+{-
+genAllLaws' :: UnsafeType -> [Instance] -> [()]
+genAllLaws' u@(getUnsafeType -> ty) insts =
+  let tyConRdr' = tyConRdr ty
+      name = fromString $ "_" <> tyConRdr' <> "Laws"
+      matches = match [] body
+      body = where'
+        (rhs (var $ fromString $ "[(\"" <> tyConRdr' <> "\", tyLaws)]"))
+        [ patBind (var "tyLaws")
+            $ rhs
+            $ list
+            $ foldMap (genLaws u) insts
+        ]
+      fun :: RawValBind
+      fun = funBind name matches
+  in []
+-}
+
+-- _FooLaws :: Laws'
+-- _FooLaws = [("Foo", tyLaws)]
+--   where
+--     tyLaws =
+--       [ eqLaws _FooGen1
+--       , functorLaws _FooGen2
+--       , bifunctorLaws _FooGen3
+--       ]
+-- ```
+
+-- = foldMap (genLaws u)
+
+genLaws :: UnsafeType -> Instance -> [HsExpr']
+genLaws (getUnsafeType -> ty) Instance{..} =
+  let tyConRdr' = tyConRdr ty
+      n = t_rdr inst_t
+  in pure $ var $ fromString $ mconcat
+       [ supportedLaws inst_supported
+       , " _Gen"
+       , tyConRdr'
+       , n
+       ]
+
+genAll :: GenMap -> [HsDecl']
+genAll = M.foldMapWithKey genAll'
+
+genAll' :: UnsafeType -> [Instance] -> [HsDecl']
+genAll' u = foldMap (gen u)
+
+-- For T_N, we need (length inst_h_tyvars - N + 1) tyvars in the
+gen :: UnsafeType -> Instance -> [HsDecl']
+gen (getUnsafeType -> ty) inst@Instance{..} =
+  let tyConRdr' = tyConRdr ty
+      name = fromString $ "_Gen" <> tyConRdr' <> t_rdr inst_t
+      laws = var "Laws"
+      --forallds = foralldTyVars inst
+      variant = var
+        $ fromString
+        $ "Gen ("
+        <> tyConRdr'
+        <> " "
+        <> fresh inst_tyvars
+        <> ")"
+      defaultGen = var "error \"Knuckles: Unable to supply generator.\""
+  in [ typeSig name $ variant --> laws
+     , funBind name $ matchRhs [] defaultGen
+     ]
+
+mksGenMap :: [InstanceHead] -> GenMap
+mksGenMap = M.unionsWith (++) . map mkGenMap
+
+plusGenMap :: GenMap -> GenMap -> GenMap
+plusGenMap = M.unionWith (++)
+
+mkGenMap :: InstanceHead -> GenMap
+mkGenMap = mkGenMap2 . mkGenMap1
+
+mkGenMap2 :: Maybe (Type, Instance) -> GenMap
+mkGenMap2 Nothing = mempty
+mkGenMap2 (Just (ty,inst)) = M.singleton (UnsafeType ty) [inst]
+
+mkGenMap1 :: InstanceHead -> Maybe (Type, Instance)
+mkGenMap1 InstanceHead{..} = do
+  ty <- whenA (length inst_h_sat == 1) $ pure (head inst_h_sat)
+  s <- getSupported inst_h_cls
+  pure (ty, Instance (supportedT s) s inst_h_tyvars)
+
+whenA :: Alternative m => Bool -> m a -> m a
+whenA b m = if b then m else A.empty
+
+supportedT :: Supported -> T
+supportedT = \case
+  Eq -> T1
+  Show -> T1
+  Semigroup -> T1
+  Monoid -> T1
+  Generic -> T1
+  Functor -> T2
+  Bifunctor -> T3
+
+allSupported :: [Supported]
+allSupported = [minBound .. maxBound]
+
+supported :: Bimap Supported OccName
+supported = B.fromList
+  $ map (\s -> (s, occName s)) allSupported
+
+getSupported :: Class -> Maybe Supported
+getSupported = flip B.lookupR supported . occName . className
+
+{-
+data InstanceHead = InstanceHead
+  { inst_h_tyvars :: [TyVar] -- unbounded, sorted
+  , inst_h_cls :: Class -- single class
+  , inst_h_sat :: [Type]
+  }
+
+-}
+
