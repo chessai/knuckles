@@ -1,6 +1,7 @@
 {-# language
         BangPatterns
       , DeriveAnyClass
+      , DerivingVia
       , DerivingStrategies
       , FlexibleContexts
       , GeneralizedNewtypeDeriving
@@ -15,6 +16,8 @@
       , ViewPatterns
       , UndecidableInstances
   #-}
+
+{-# options_ghc -fno-warn-orphans #-}
 
 module Knuckles.Monad
   ( Knuckles(..)
@@ -34,6 +37,7 @@ import GHC (runGhc)
 import GHC.Paths (libdir)
 import GhcMonad
 import Outputable
+import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow)
 import qualified Distribution.Verbosity as Cabal
 
 newtype Knuckles a = Knuckles
@@ -42,6 +46,11 @@ newtype Knuckles a = Knuckles
   deriving newtype (MonadReader Env)
   deriving newtype (MonadError KnucklesError)
   deriving newtype (HasDynFlags)
+  deriving newtype (MonadCatch, MonadMask, MonadThrow)
+
+deriving via (ReaderT Session IO) instance MonadCatch Ghc
+deriving via (ReaderT Session IO) instance MonadThrow Ghc
+deriving via (ReaderT Session IO) instance MonadMask Ghc
 
 instance GhcMonad Knuckles where
   getSession = liftGhc getSession
@@ -94,6 +103,7 @@ data Env = Env
   FilePath -- ^ cabal file (tld </> self)
   FilePath -- ^ top-level dir
   FilePath -- ^ package environment file
+  FilePath -- ^ test dir (tld </> self)
 
 withEnv :: MonadReader r m => (r -> m a) -> m a
 withEnv f = ask >>= f

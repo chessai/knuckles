@@ -1,62 +1,54 @@
 {-# language
-        BangPatterns
-      , DeriveAnyClass
+        DeriveAnyClass
       , DerivingStrategies
       , FlexibleContexts
       , GeneralizedNewtypeDeriving
-      , InstanceSigs
       , LambdaCase
       , NoMonomorphismRestriction
       , OverloadedStrings
-      , RankNTypes
       , RecordWildCards
-      , ScopedTypeVariables
-      , StandaloneDeriving
-      , TypeApplications
       , ViewPatterns
-      , UndecidableInstances
   #-}
 
-{-# options_ghc -fno-warn-unused-imports #-}
+module Knuckles
+  ( main
+  ) where
 
-module Knuckles where
-
-import Data.Char (isSpace)
-import Data.String (fromString)
-import Data.Foldable (fold)
+import Class (className)
+import Control.Monad.Catch (MonadMask)
 import Control.Monad.Except
 import Control.Monad.Reader
-import Class
 import CoreSyn (isOrphan)
+import Data.Bifunctor (first)
 import Data.Bimap (Bimap)
-import qualified Data.Bimap as B
-import qualified Control.Applicative as A
-import Data.List (intercalate)
+import Data.Char (isSpace)
+import Data.Foldable (fold)
+import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
+import Data.List (intercalate,groupBy)
 import Data.Map.Strict (Map)
+import Data.Maybe (fromMaybe)
 import Data.Monoid
-import Digraph
-import DynFlags
-import Exception (ExceptionMonad(..))
+import Data.Set (Set)
+import Data.String (fromString)
 import GHC
-import GHC.LanguageExtensions.Type
-import GHC.Paths (libdir)
 import GHC.SourceGen
 import GhcMake
-import GhcMonad
 import HscMain (batchMsg)
 import HscTypes
 import InstEnv
 import Knuckles.Monad
-import Module
 import Name
 import Options.Applicative
-import DriverPhases (isHaskellishTarget)
 import Outputable hiding ((<>),text)
-import System.Environment (getArgs)
 import System.FilePath
+import System.IO.Unsafe (unsafePerformIO)
 import TyCon
 import Type
+import qualified Control.Applicative as A
+import qualified Control.Monad.Catch as Catch
+import qualified Data.Bimap as B
 import qualified Data.Map.Strict as M
+import qualified Data.Set as S
 import qualified Distribution.Compat.Exception as Cabal
 import qualified Distribution.ModuleName as Cabal
 import qualified Distribution.PackageDescription.Parsec as Cabal
@@ -77,32 +69,42 @@ envInfo = info ((Env
   <*> ( strOption $ fold [ long "tld", help "top level directory of cabal project" ]
       )
   <*> ( strOption $ fold [ long "env", help "ghc environment file" ]
-      )) <**> helper) mempty
+      )
+  <*> ( strOption $ fold [ long "test", help "test directory" ]
+      )
+  ) <**> helper) mempty
+
+withCurrentDir :: (MonadIO m, MonadMask m)
+  => FilePath
+  -> m a
+  -> m a
+withCurrentDir dir act
+  = Catch.bracket
+      (liftIO Dir.getCurrentDirectory)
+      (\ogDir -> liftIO (Dir.setCurrentDirectory ogDir))
+      $ const (liftIO (Dir.setCurrentDirectory dir) >> act)
 
 main :: IO ()
 main = do
   env <- execParser envInfo
   (putStrLn . showSDocUnsafe . ppr) =<< runKnuckles'
     env
-    (withEnv $ \(Env _ proj tld genv) -> do {
+    (withEnv $ \(Env _ proj tld genv testDir) -> do {
         dflags <- getSessionDynFlags
       ; void $ setSessionDynFlags $ dflags { packageEnv = Just genv }
       ; liftIO $ Dir.setCurrentDirectory tld
       ; (hsSrcDir, module_names) <- getModules proj
-      ; liftIO $ Dir.setCurrentDirectory hsSrcDir
-      ; _ <- loadProj module_names
-      ; module_graph <- getModuleGraph
-      ; tcs <- mapM typecheck (mgModSummaries module_graph)
-      ; let cls_insts = concatMap gatherClsInsts tcs
-      -- ; pure $ map clsInstOccName cls_insts
+      ; withCurrentDir hsSrcDir $ void $ loadProj module_names
+      ; cls_insts <- getProjClsInsts
       ; let inst_heads = map clsInstHead cls_insts
-      ; let gen_map = mksGenMap inst_heads
-      ; let gen_module = genModule gen_map
+      ; let gen_map = collectTyCons (mksGenMap inst_heads)
+      ; let gen_module = genModule module_names gen_map
       ; dflags' <- getSessionDynFlags
       ; let module_text = showPpr dflags' gen_module
-      ; liftIO $ writeFile "test.hs" module_text
-      ; pure $ gen_map --inst_heads
-      -- ; pure $ (map ClsInstPpr cls_insts, map instanceHead cls_insts)
+      ; withCurrentDir testDir
+          $ liftIO
+          $ writeFile "test.hs" module_text
+      ; pure $ gen_map
     })
 
 isCabal :: MonadError KnucklesError m
@@ -116,11 +118,11 @@ doesCabalExist fp = do
   h <- liftIO $ Dir.doesFileExist fp
   unless h $ throwError FilePassedDoesNotExist
 
-type HsSrcDir = FilePath
-
 getModules :: (MonadIO m, MonadError KnucklesError m, MonadReader Env m)
-  => FilePath -> m (HsSrcDir, [ModuleName])
-getModules fp = withEnv $ \(Env v _ _ _) -> do
+  => FilePath -> m (FilePath, [ModuleName])
+getModules fp = withEnv $ \(Env v _ _ _ _) -> do
+  doesCabalExist fp
+  isCabal fp
   pkgDescr <- liftIO $ Cabal.catchIO
     (Right <$> Cabal.readGenericPackageDescription v fp)
     (pure . Left)
@@ -128,20 +130,20 @@ getModules fp = withEnv $ \(Env v _ _ _) -> do
     Left e -> throwError (CabalThrewAnError e)
     Right g -> maybeToError (Cabal.condLibrary g) NoLibraryComponent
       $ \condTreeLib -> do
+          let treeData = Cabal.condTreeData condTreeLib
           let hsSrcDirs = id
                 . Cabal.hsSourceDirs
                 . Cabal.libBuildInfo
-                . Cabal.condTreeData
-                $ condTreeLib
+                $ treeData
           when (length hsSrcDirs /= 1)
             $ throwError MoreThanOneHsSourceDir
+          let hsSrcDir = head hsSrcDirs
           let modules = id
                 . fmap mkModuleName
                 . fmap Cabal.toFilePath
                 . Cabal.explicitLibModules
-                . Cabal.condTreeData
-                $ condTreeLib
-          pure (head hsSrcDirs, modules)
+                $ treeData
+          pure (hsSrcDir, modules)
 
 maybeToError :: MonadError e m => Maybe a -> e -> (a -> m b) -> m b
 maybeToError Nothing e _ = throwError e
@@ -167,8 +169,8 @@ getProjClsInsts = do {
 gatherClsInsts :: TypecheckedModule -> [ClsInst]
 gatherClsInsts (tm_internals_ -> (_, moddets)) = md_insts moddets
 
-clsInstOccName :: ClsInst -> OccName
-clsInstOccName = occName . is_cls_nm
+--clsInstOccName :: ClsInst -> OccName
+--clsInstOccName = occName . is_cls_nm
 
 clsInstHead :: ClsInst -> InstanceHead
 clsInstHead (instanceHead -> (tyvars, cls, types))
@@ -206,6 +208,7 @@ pprInst ClsInst{..} = O.hcat
   , O.text "IsOrphan: ", ppr (isOrphan is_orphan), O.text "\n"
   ]
 
+-- TODO: Only types with valid Eq/Show instances can be used
 -- TODO: stop ignoring default extensions
 -- TODO: get fully qualified Class name, to ensure actual equality
 -- TODO: must be a vanilla algtycon
@@ -384,16 +387,10 @@ instance HasOccName Supported where
     Bifunctor -> "Bifunctor"
 
 data T = T1 | T2 | T3
-  deriving (Show)
+  deriving (Show,Eq,Ord,Enum,Bounded)
 
 instance Outputable T where
   ppr = O.text . show
-
-data Gen = Gen
-  { gen_t :: T
-  , gen_tycon :: TyCon
-  , gen_tyvars :: [TyVar]
-  }
 
 data Instance = Instance
   { inst_t :: T
@@ -416,131 +413,145 @@ instance Ord UnsafeType where
   compare (UnsafeType x) (UnsafeType y)
     = nonDetCmpType x y
 
-instances_ts :: [Instance] -> [T]
-instances_ts = map inst_t
+instance Show UnsafeType where
+  show (UnsafeType ty) = showSDocUnsafe (ppr ty)
+
+--instances_ts :: [Instance] -> [T]
+--instances_ts = map inst_t
 
 t_rdr :: T -> String
 t_rdr = \case { T1 -> "1"; T2 -> "2"; T3 -> "3" }
 
 -- number of tyvars for us to fill in
-foralldTyVars :: Instance -> Int
-foralldTyVars Instance{..} = max 0
-  (length inst_tyvars + 1 - (case inst_t of {
-    T1 -> 1; T2 -> 2; T3 -> 3
-  }))
+--foralldTyVars :: Instance -> Int
+--foralldTyVars Instance{..} = max 0
+--  (length inst_tyvars + 1 - (case inst_t of {
+--    T1 -> 1; T2 -> 2; T3 -> 3
+--  }))
 
 trim :: String -> String
 trim = f . f
   where
     f = reverse . dropWhile isSpace
 
-fresh :: [a] -> String
-fresh = intercalate " " . reverse . snd . foldl
-  (\(accNum::Int, accList) _
-     -> (accNum + 1, "x" <> show accNum : accList)
-  ) (0, [])
+fresh :: Int -> String
+fresh n = id
+  . trim
+  . intercalate " "
+  . take n
+  . map (\(x,nth) -> x ++ show nth)
+  $ zip (cycle ["x"]) [(0::Int)..]
 
-genModule :: GenMap -> HsModule'
-genModule gen_map = module'
-  (Just "Test")
+ints :: Int -> String
+ints n = trim
+  . intercalate " "
+  $ replicate n "Integer"
+
+{-| Gather kinds of TyVars
+ -  Fill in fake based on kind
+ -}
+--kind0, kind1, kind2 :: String
+--kind0 = "Integer"; kind1 = "Identity"; kind2 = "Either"
+
+genModule :: [ModuleName] -> GenMap -> HsModule'
+genModule (map (import' . ModuleNameStr) -> extraImports) gen_map = module'
+  (Just "Main")
   (Just [var "main"])
-  [ import' "Hedgehog"
-  , import' "Hedgehog.Classes"
-  , import' "Hedgehog.Generic"
-  , as' (import' "Hedgehog.Gen") "Gen"
-  ]
-  ( [type' "Laws" [] (var "[(String, [Laws])]")]
-  ++ [ typeSig "allLaws" $ var "Laws'"
-     , funBind "allLaws" $ matchRhs [] $ var $
-         fromString $ "mconcat $\n  [\n  ]"
+  ( [ import' "Hedgehog"
+    , import' "Hedgehog.Classes"
+    , import' "Hedgehog.Generic"
+    , qualified' (as' (import' "Hedgehog.Gen") "Gen")
+    , qualified' (as' (import' "Hedgehog.Range") "Range")
+    ]
+    ++ extraImports
+  )
+  ( [type' laws [] (var "[(String, [Laws])]")]
+  ++ [ typeSig "main" $ var "IO Bool"
+     , funBind "main"
+         $ matchRhs []
+         $ var "lawsCheckMany" @@ var "allLaws"
+     , typeSig "allLaws" $ var "Laws'"
+     , funBind "allLaws"
+         $ matchRhs []
+         $ var "mconcat" @@ bode allLawsBody
      ]
   ++ genAll gen_map
+  ++ allLawsDecls
   )
+  where
+    (allLawsBody, allLawsDecls) = genAllLaws gen_map
 
+laws :: RdrNameStr
+laws = "Laws'"
 
--- _FooLaws :: Laws'
--- _FooLaws = [("Foo", tyLaws)]
---   where
---     tyLaws =
---       [ eqLaws _FooGen1
---       , functorLaws _FooGen2
---       , bifunctorLaws _FooGen3
---       ]
--- ```
-
--- type Laws' = [(String, [Laws])]
---
--- allLaws :: Laws'
--- allLaws = mconcat
---   [ _FooLaws
---   ]
--- import Hedgehog
--- import Hedgehog.Classes
--- import Hedgehog.Generic
--- import qualified Hedgehog.Gen as Gen
--- import qualified Hedgehog.Range as Range
-
--- _FooLaws :: Laws'
--- _FooLaws = [("Foo", tyLaws)]
---   where
---     tyLaws =
---       [ eqLaws _FooGen1
---       , functorLaws _FooGen2
---       , bifunctorLaws _FooGen3
---       ]
--- ```
+bode :: [String] -> HsExpr'
+bode = list . fmap (var . fromString)
 
 tyConRdr :: Type -> String
 tyConRdr = occNameString . occName . tyConName . tyConAppTyCon
 
-{-
-data Instance = Instance
-  { inst_t :: T
-  , inst_supported :: Supported
-  , inst_tyvars :: [TyVar]
-  }
-
--}
-
 -- TODO: a lot of the generator code is not idiomatic
+--       (i.e. does not use ast but instead uses fromString)
 
---genAllLaws :: GenMap -> HsExpr'
---genAllLaws = list . M.foldMapWithKey genAllLaws'
-{-
-genAllLaws' :: UnsafeType -> [Instance] -> [()]
+genAllLaws :: GenMap -> ([String],[HsDecl'])
+genAllLaws = id
+  . M.foldMapWithKey (\u insts -> first pure (genAllLaws' u insts))
+
+--unsafeCompareByTyCon :: UnsafeType -> UnsafeType -> Ordering
+--unsafeCompareByTyCon u u' = nonDetCmpTc (go u) (go u') where
+--  go = tyConAppTyCon . getUnsafeType
+
+unsafeEqByTyCon :: UnsafeType -> UnsafeType -> Bool
+unsafeEqByTyCon u u' = case nonDetCmpTc (go u) (go u') of
+  EQ -> True
+  _ -> False
+  where
+    go = tyConAppTyCon . getUnsafeType
+
+-- remove redundant tycons
+collectTyCons :: GenMap -> GenMap
+collectTyCons = id
+  . M.fromList
+  . map
+      ( first
+          ( fromMaybe (error "Knuckles: collectTyCon: internal error")
+          . getFirst
+          )
+      . foldMap (\(u, is) -> (First (Just u), is))
+      )
+  . groupBy (\(u, _) (u', _) -> unsafeEqByTyCon u u')
+  . M.toList
+
+genAllLaws' :: UnsafeType -> [Instance] -> (String, [HsDecl'])
 genAllLaws' u@(getUnsafeType -> ty) insts =
   let tyConRdr' = tyConRdr ty
       name = fromString $ "_" <> tyConRdr' <> "Laws"
       matches = match [] body
       body = where'
-        (rhs (var $ fromString $ "[(\"" <> tyConRdr' <> "\", tyLaws)]"))
-        [ patBind (var "tyLaws")
-            $ rhs
+        (rhs $ var "pure $" @@ -- couldnt see immediately how to wrap
+                               -- something in the list constructor
+          (tuple
+            [ var (fromString ("\"" ++ tyConRdr' ++ "\""))
+            , var "tyLaws"
+            ]
+          )
+        )
+        [ funBind "tyLaws"
+            $ matchRhs []
             $ list
-            $ foldMap (genLaws u) insts
+            $ foldMap (pure . genLaws u) insts
         ]
-      fun :: RawValBind
-      fun = funBind name matches
-  in []
--}
+      bind =
+        [ typeSig name $ var "Laws'"
+        , funBind name matches
+        ]
+  in (name, bind)
 
--- _FooLaws :: Laws'
--- _FooLaws = [("Foo", tyLaws)]
---   where
---     tyLaws =
---       [ eqLaws _FooGen1
---       , functorLaws _FooGen2
---       , bifunctorLaws _FooGen3
---       ]
--- ```
-
--- = foldMap (genLaws u)
-
-genLaws :: UnsafeType -> Instance -> [HsExpr']
+genLaws :: UnsafeType -> Instance -> HsExpr'
 genLaws (getUnsafeType -> ty) Instance{..} =
   let tyConRdr' = tyConRdr ty
       n = t_rdr inst_t
-  in pure $ var $ fromString $ mconcat
+  in var $ fromString $ mconcat
        [ supportedLaws inst_supported
        , " _Gen"
        , tyConRdr'
@@ -548,35 +559,78 @@ genLaws (getUnsafeType -> ty) Instance{..} =
        ]
 
 genAll :: GenMap -> [HsDecl']
-genAll = M.foldMapWithKey genAll'
+genAll = M.foldMapWithKey (foldMap . gen)
 
-genAll' :: UnsafeType -> [Instance] -> [HsDecl']
-genAll' u = foldMap (gen u)
+t_vars :: T -> Int
+t_vars = \case { T1 -> 0; T2 -> 1; T3 -> 2; }
 
--- For T_N, we need (length inst_h_tyvars - N + 1) tyvars in the
+globalGenState :: IORef (Map UnsafeType (Set T))
+globalGenState = unsafePerformIO $ newIORef mempty
+{-# noinline globalGenState #-}
+
+hasGen :: UnsafeType -> T -> IO Bool
+hasGen u t = do
+  genState <- readIORef globalGenState
+  case M.lookup u genState of
+    Nothing -> pure False
+    Just s -> pure $ S.member t s
+
+putGen :: UnsafeType -> T -> IO ()
+putGen u t = modifyIORef' globalGenState
+  (\m -> M.alter
+    (\case {
+        Nothing -> Just (S.singleton t)
+      ; Just s -> Just (S.insert t s)
+    }) u m
+  )
+
 gen :: UnsafeType -> Instance -> [HsDecl']
-gen (getUnsafeType -> ty) inst@Instance{..} =
-  let tyConRdr' = tyConRdr ty
-      name = fromString $ "_Gen" <> tyConRdr' <> t_rdr inst_t
-      laws = var "Laws"
-      --forallds = foralldTyVars inst
-      variant = var
-        $ fromString
-        $ "Gen ("
-        <> tyConRdr'
-        <> " "
-        <> fresh inst_tyvars
-        <> ")"
-      defaultGen = var "error \"Knuckles: Unable to supply generator.\""
-  in [ typeSig name $ variant --> laws
-     , funBind name $ matchRhs [] defaultGen
-     ]
+gen u@(getUnsafeType -> ty) Instance{..} = unsafePerformIO $ do {
+    has_gen <- hasGen u inst_t
+  ; if has_gen then pure [] else do {
+      let tyConRdr' = tyConRdr ty
+    ; let name = fromString $ trim $ "_Gen" <> tyConRdr' <> t_rdr inst_t
+    ; let n_tyvars = length inst_tyvars
+    ; let n_foralld_tyvars = t_vars inst_t
+    ; let n_solid_tyvars = n_tyvars
+    ; let foralldsCrap = case inst_t of {
+              T1 -> ""
+            ; T2 -> "Gen x0 -> "
+            ; T3 -> "Gen x0 -> Gen x1 -> "
+          }
+    ; let variant = var
+            $ fromString
+            $ foralldsCrap
+            <> "Gen "
+            <> wrap
+              ( mconcat
+                [ tyConRdr'
+                , " "
+                , ints n_solid_tyvars
+                , " "
+                , fresh n_foralld_tyvars
+                ]
+              )
+    ; let defaultGen
+            = var "error \"Knuckles: Unable to supply generator.\""
+    ; let decls =
+            [ typeSig name $ variant
+            , funBind name $ matchRhs [] defaultGen
+            ]
+    ; putGen u inst_t
+    ; pure decls
+    }
+  }
+{-# noinline gen #-}
+
+wrap :: String -> String
+wrap s = "(" ++ s ++ ")"
 
 mksGenMap :: [InstanceHead] -> GenMap
 mksGenMap = M.unionsWith (++) . map mkGenMap
 
-plusGenMap :: GenMap -> GenMap -> GenMap
-plusGenMap = M.unionWith (++)
+--plusGenMap :: GenMap -> GenMap -> GenMap
+--plusGenMap = M.unionWith (++)
 
 mkGenMap :: InstanceHead -> GenMap
 mkGenMap = mkGenMap2 . mkGenMap1
@@ -593,6 +647,9 @@ mkGenMap1 InstanceHead{..} = do
 
 whenA :: Alternative m => Bool -> m a -> m a
 whenA b m = if b then m else A.empty
+
+--unlessA :: Alternative m => Bool -> m a -> m a
+--unlessA b m = if b then A.empty else m
 
 supportedT :: Supported -> T
 supportedT = \case
@@ -613,13 +670,4 @@ supported = B.fromList
 
 getSupported :: Class -> Maybe Supported
 getSupported = flip B.lookupR supported . occName . className
-
-{-
-data InstanceHead = InstanceHead
-  { inst_h_tyvars :: [TyVar] -- unbounded, sorted
-  , inst_h_cls :: Class -- single class
-  , inst_h_sat :: [Type]
-  }
-
--}
 
